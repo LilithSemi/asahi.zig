@@ -405,7 +405,7 @@ const WAIT_PIX_C: [4]u8 = .{ 0x48, 0x0C, 0x00, 0x00 };
 //   mov_imm r2, 0.0 ; mov_imm r3, 1.0
 //   st_var{0,1,2,3}; stop
 // The VS now uses r0,r1,r2,r3,r5 -> 6 GPRs (the USC REGISTERS word must cover
-// r5; buildVsUsc is called with gpr_count=6).
+// r5; the USC register count is measured in 16-bit halves, not 32-bit registers).
 // ---------------------------------------------------------------------------
 
 /// `iadd r0, r5, r5` (8B) - r0 = vid*2. Disassembler-verified bytes.
@@ -423,8 +423,13 @@ const VS_FMADD_R0: [8]u8 = .{ 0x3A, 0x81, 0x40, 0x02, 0x00, 0x30, 0x80, 0x01 };
 /// `fmadd32 r1, r1, 2.0, -1.0` (8B) - y = r1*2 - 1.
 const VS_FMADD_R1: [8]u8 = .{ 0x3A, 0x85, 0x42, 0x02, 0x00, 0x30, 0x80, 0x01 };
 
-/// The number of GPRs the (real) vertex shader uses: r0..r3 + r5 (vertex_id).
-pub const VS_GPR_COUNT: u32 = 6;
+/// USC register counts use 16-bit halves. Reserve through r6 because the
+/// vertex stage preloads vertex/instance IDs into r5/r6, even when unused.
+/// Mesa accounts for these preloads in agx_register_allocate.c. Declaring six
+/// halves only allocated r0..r3 (after rounding), causing a GPU timeout.
+pub const VS_GPR_COUNT: u32 = 14;
+/// The fragment shader writes r4/r5, so it needs halves 0..11.
+pub const FS_GPR_COUNT: u32 = 12;
 
 /// Build the REAL vertex_id-indexed vertex shader binary into `out`, returns
 /// bytes written. Computes the covering fullscreen-triangle clip position from
@@ -827,7 +832,7 @@ fn uscShader(buf: []u8, code_off: u32, unk2: u6, loads_varyings: bool) usize {
 }
 
 /// Emit a USC REGISTERS word (4 bytes). genxml "USC Registers": Tag@0(8),
-/// Register count@8(5) groups(8), Unk1@13(1), Spill@18(4), Unk4@24(8). Mesa's
+/// Register count@8(5) groups(8) of 16-bit halves, Unk1@13(1), Spill@18(4), Unk4@24(8). Mesa's
 /// linker (agx_linker.c:191) sets Unk1 = fragment and Unk4 = 1 for VS/FS; the
 /// bg/eot compute-style path (agx_bg_eot.c) leaves both default (Unk4=0). The M1
 /// dump confirms: VS Unk1=false/Unk4=0x1, FS Unk1=true/Unk4=0x1, bg/eot
@@ -1621,12 +1626,14 @@ pub fn buildPpp(buf: []u8, fs_usc_off: u32) usize {
     // non-null and the indices are valid). pass_type=Opaque(0), depth/stencil off.
     {
         var w = BitWriter{};
+        w.set(9, 1, 1); // Fragment Control Unk 1: required by Mesa genxml.
         w.set(16, 1, 1); // scissor_enable = true
         n += w.emit(buf[n..], 4);
     }
-    // FRAGMENT_CONTROL_2 (4B): tag_write_disable off (we DO want pixels). 0.
+    // FRAGMENT_CONTROL_2 uses the same Fragment Control layout.
     {
         var w = BitWriter{};
+        w.set(9, 1, 1);
         n += w.emit(buf[n..], 4);
     }
     // FRAGMENT_FACE front (4B): depth function Always(7) @24, depth write
@@ -2101,16 +2108,16 @@ fn runRenderCore(
     const ps_code_off: u32 = @intCast(PS_CODE_VA - USC_EXEC_BASE);
     const eot_code_off: u32 = @intCast(EOT_CODE_VA - USC_EXEC_BASE);
     const bg_code_off: u32 = @intCast(BG_CODE_VA - USC_EXEC_BASE);
-    // VS uses r0..r3 + r5; binds the mandatory reserved txf sampler.
+    // VS uses r0..r3 + r5; also reserve the r6 instance-ID preload.
     _ = buildVsUsc(vs_usc.cpu[0..], vs_code_off, VS_GPR_COUNT, SAMPLER_HEAP_VA);
     // FS uses r4,r5 (fp16 color halves); binds the mandatory sampler + the color
-    // uniform (4 fp16 halves at FS_COLOR_VA, read as u8,u9). 6 GPRs covers r5.
-    _ = buildFsUsc(ps_usc.cpu[0..], ps_code_off, 6, SAMPLER_HEAP_VA, FS_COLOR_VA);
+    // uniform (4 fp16 halves at FS_COLOR_VA, read as u8,u9).
+    _ = buildFsUsc(ps_usc.cpu[0..], ps_code_off, FS_GPR_COUNT, SAMPLER_HEAP_VA, FS_COLOR_VA);
     // bg USC SHADER points at the dedicated BG clear code; SHARED+SHADER+REGISTERS+
     // NO_PRESHADER only (no UNIFORM word - the baked clear reads no uniform, so the
     // USC, the Counts, and the shader all agree on "no uniforms" - R4 fix).
-    _ = buildBgUsc(bg_usc.cpu[0..], bg_code_off, 4); // bg uses r0..r3, no uniforms
-    _ = buildEotUsc(eot_usc.cpu[0..], eot_code_off, 1, PBE_VA);
+    _ = buildBgUsc(bg_usc.cpu[0..], bg_code_off, 8); // r0..r3: eight halves
+    _ = buildEotUsc(eot_usc.cpu[0..], eot_code_off, 2, PBE_VA); // r0: two halves
 
     // The PBE descriptor for the linear color attachment (caller's output VA).
     // Stride = width*4 (linear RGBA8), width/height = the framebuffer geometry.
@@ -2609,7 +2616,7 @@ pub fn dumpStream(w: *std.Io.Writer, draw: bool) void {
     // The FS USC block (to surface the Fragment Properties word in the dump).
     var fs_usc_buf: [PAGE]u8 = undefined;
     @memset(fs_usc_buf[0..], 0);
-    const fs_usc_len = buildFsUsc(fs_usc_buf[0..], @intCast(PS_CODE_VA - USC_EXEC_BASE), 6, SAMPLER_HEAP_VA, FS_COLOR_VA);
+    const fs_usc_len = buildFsUsc(fs_usc_buf[0..], @intCast(PS_CODE_VA - USC_EXEC_BASE), FS_GPR_COUNT, SAMPLER_HEAP_VA, FS_COLOR_VA);
 
     var vdm_buf: [PAGE]u8 = undefined;
     @memset(vdm_buf[0..], 0);
@@ -2875,7 +2882,7 @@ test "USC blocks have the expected tag order and sizes" {
     var buf: [64]u8 = undefined;
     // VS USC: Sampler(8)+Shared(4)+Shader(6)+Registers(4)+NoPreshader(2) = 24.
     // The mandatory reserved-txf SAMPLER comes FIRST (the graphics root descriptor).
-    const vn = buildVsUsc(&buf, 0x1000, 4, SAMPLER_HEAP_VA);
+    const vn = buildVsUsc(&buf, 0x1000, VS_GPR_COUNT, SAMPLER_HEAP_VA);
     try std.testing.expectEqual(@as(usize, 24), vn);
     try std.testing.expectEqual(USC_TAG_SAMPLER, buf[0]);
     // Sampler word: start 0, count 1, buffer = sampler heap >> 3.
@@ -2887,6 +2894,8 @@ test "USC blocks have the expected tag order and sizes" {
     try std.testing.expectEqual(USC_TAG_SHARED, buf[8]);
     try std.testing.expectEqual(USC_TAG_SHADER, buf[12]);
     try std.testing.expectEqual(USC_TAG_REGISTERS, buf[18]);
+    // Two groups of eight halves cover both r5 and the r6 ABI preload.
+    try std.testing.expectEqual(@as(u32, 2), (rdU32(&buf, 18) >> 8) & 0x1F);
     try std.testing.expectEqual(USC_TAG_NO_PRESHADER, buf[22]);
 
     // EOT USC: Texture(8)+Shared(4)+Shader(6)+Registers(4)+NoPreshader(2) = 24.
@@ -2914,7 +2923,7 @@ test "USC blocks have the expected tag order and sizes" {
     // FragmentProperties(4)+NoPreshader(2) = 36. The FS now carries the MANDATORY
     // graphics root descriptor (reserved-txf SAMPLER + the color UNIFORM Mesa's
     // noddtri FS reads) AND the FRAGMENT PROPERTIES word.
-    const fbuf_n = buildFsUsc(&buf, 0x3000, 6, SAMPLER_HEAP_VA, FS_COLOR_VA);
+    const fbuf_n = buildFsUsc(&buf, 0x3000, FS_GPR_COUNT, SAMPLER_HEAP_VA, FS_COLOR_VA);
     try std.testing.expectEqual(@as(usize, 36), fbuf_n);
     // (1) reserved txf SAMPLER first.
     try std.testing.expectEqual(USC_TAG_SAMPLER, buf[0]);
@@ -2937,6 +2946,7 @@ test "USC blocks have the expected tag order and sizes" {
     try std.testing.expectEqual(USC_TAG_REGISTERS, buf[26]);
     // fragment REGISTERS unk1 @13 = true, unk4 @24 = 1.
     const fregs = rdU32(&buf, 26);
+    try std.testing.expectEqual(@as(u32, 2), (fregs >> 8) & 0x1F); // covers r4/r5
     try std.testing.expectEqual(@as(u32, 1), (fregs >> 13) & 1);
     try std.testing.expectEqual(@as(u32, 1), (fregs >> 24) & 0xFF);
     // the mandatory FRAGMENT PROPERTIES word.
@@ -3041,6 +3051,9 @@ test "per-draw PPP header sets present bits, enables scissor, no viewport (own b
     // FRAGMENT_CONTROL (first word after header) has scissor_enable @16 = 1.
     const fc = std.mem.readInt(u32, buf[4..8], .little);
     try std.testing.expectEqual(@as(u32, 1), (fc >> 16) & 1);
+    // Both Fragment Control words require the genxml exact=true bit.
+    try std.testing.expectEqual(@as(u32, 1), (fc >> 9) & 1);
+    try std.testing.expectEqual(@as(u32, 1), (rdU32(&buf, 8) >> 9) & 1);
     // OUTPUT_SELECT word is 0 (position-only VS, no varyings) - the Mesa-correct
     // value for our shaders (osel.varyings = nr_cf_bindings>0 = 0).
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[28..32], .little));

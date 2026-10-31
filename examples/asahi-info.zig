@@ -327,7 +327,7 @@ fn linuxMain(init: std.process.Init.Minimal) void {
             // fault). AGX is cache-coherent, so this is NOT a stale read: nothing
             // was stored to the center pixel -> the bg clear AND the eot store
             // did not land -> an ENCODING bug (bg/eot/PBE/tile config).
-            lw.print("triangle: MISMATCH readback == kSentinel 0x{X:0>8} (NOTHING stored - bg/eot/PBE ENCODING bug, coherency ruled out)\n", .{asahi.render.kSentinel}) catch {};
+            lw.print("triangle: MISMATCH readback == kSentinel 0x{X:0>8} (nothing stored; check journalctl -k for GPU faults/timeouts, including vertex/fragment execution failures)\n", .{asahi.render.kSentinel}) catch {};
         } else {
             lw.print("triangle: MISMATCH readback is none of kTriColor/kClearColor/kSentinel (partial/wrong store - note it)\n", .{}) catch {};
         }
