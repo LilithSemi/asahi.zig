@@ -22,7 +22,6 @@
       nameValuePair = name: value: { inherit name value; };
       genAttrs = names: f: builtins.listToAttrs (map (n: nameValuePair n (f n)) names);
       allSystems = [
-        "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
       ];
