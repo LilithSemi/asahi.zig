@@ -9,5 +9,5 @@ result-*
 # ---> Zig
 .zig-cache/
 zig-out/
+zig-pkg/
 *.o
-
