@@ -90,6 +90,8 @@ fn chipName(chip_id: u32) []const u8 {
 
 /// The Asahi AGX device: the open render-node fd. Owns the fd unless adopted.
 pub const Device = struct {
+    /// Borrowed from the caller; must remain valid for the device's lifetime.
+    io: std.Io,
     fd: std.posix.fd_t,
     owns_fd: bool = true,
     /// Diagnostics for the most recent FAILING ioctl: the raw errno and the
@@ -102,19 +104,14 @@ pub const Device = struct {
 
     /// The kernel driver name behind /dev/dri/renderD<n> - the basename of the
     /// /sys/class/drm/renderD<n>/device/driver symlink target - or null if the
-    /// node does not exist. The sysfs path MUST be NUL-terminated for readlink:
-    /// passing a plain bufPrint (non-NUL) slice makes readlink read past the
-    /// string into uninitialized stack, so the lookup silently fails. That was
-    /// the bug that hid the asahi node on real hardware (the dev box has no
-    /// asahi node, so it returned NoDevice either way and masked it).
-    pub fn renderNodeDriver(n: u32, name_buf: []u8) ?[]const u8 {
+    /// link cannot be read. Uses the caller's Io to read the sysfs symlink.
+    pub fn renderNodeDriver(io: std.Io, n: u32, name_buf: []u8) ?[]const u8 {
         var nbuf: [80]u8 = undefined;
-        const sys = std.mem.printSentinel(&nbuf, "/sys/class/drm/renderD{d}/device/driver", .{n}, 0) catch return null;
+        const sys = std.fmt.bufPrint(&nbuf, "/sys/class/drm/renderD{d}/device/driver", .{n}) catch return null;
         var lbuf: [256]u8 = undefined;
-        const link = std.os.linux.readlink(sys.ptr, &lbuf, lbuf.len);
-        const ll: isize = @bitCast(link);
-        if (ll <= 0) return null;
-        const target = lbuf[0..@intCast(ll)];
+        const len = std.Io.Dir.readLinkAbsolute(io, sys, &lbuf) catch return null;
+        if (len == 0) return null;
+        const target = lbuf[0..len];
         const slash = std.mem.lastIndexOfScalar(u8, target, '/');
         const base = if (slash) |s| target[s + 1 ..] else target;
         const m = @min(base.len, name_buf.len);
@@ -125,15 +122,15 @@ pub const Device = struct {
     /// Scan /dev/dri/renderD128.. for the node whose kernel driver is "asahi"
     /// and open it O_RDWR | O_CLOEXEC. Mirrors the virtio_gpu discovery in the
     /// virgl Linux transport.
-    pub fn open() Error!Device {
+    pub fn open(io: std.Io) Error!Device {
         var n: u32 = 128;
         while (n < 192) : (n += 1) {
             var nbuf: [32]u8 = undefined;
-            const driver = renderNodeDriver(n, &nbuf) orelse continue;
+            const driver = renderNodeDriver(io, n, &nbuf) orelse continue;
             if (std.mem.eql(u8, driver, "asahi")) {
                 var pbuf: [64]u8 = undefined;
                 const path = std.mem.printSentinel(&pbuf, "/dev/dri/renderD{d}", .{n}, 0) catch continue;
-                return openNode(path) catch continue;
+                return openNode(io, path) catch continue;
             }
         }
         return error.NoDevice;
@@ -141,20 +138,20 @@ pub const Device = struct {
 
     /// Open a specific render node path O_RDWR | O_CLOEXEC (the forced-node
     /// fallback for when sysfs discovery is unavailable).
-    pub fn openNode(path: []const u8) Error!Device {
+    pub fn openNode(io: std.Io, path: []const u8) Error!Device {
         var buf: [128]u8 = undefined;
         const z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return error.OpenFailed;
         const rc = std.os.linux.open(z.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
         switch (std.os.linux.errno(rc)) {
-            .SUCCESS => return .{ .fd = @intCast(rc) },
+            .SUCCESS => return .{ .io = io, .fd = @intCast(rc) },
             else => return error.OpenFailed,
         }
     }
 
     /// Adopt an already-open render-node fd (e.g. a card node from a display
     /// owner). The Device does not close it.
-    pub fn adopt(fd: std.posix.fd_t) Device {
-        return .{ .fd = fd, .owns_fd = false };
+    pub fn adopt(io: std.Io, fd: std.posix.fd_t) Device {
+        return .{ .io = io, .fd = fd, .owns_fd = false };
     }
 
     pub fn deinit(self: *Device) void {
@@ -412,9 +409,7 @@ pub const Device = struct {
     /// deadline, so a relative `timeout_ns` is added to now(); WAIT_FOR_SUBMIT
     /// is set so a not-yet-submitted fence is waited on rather than failing.
     pub fn syncobjWait(self: *Device, handles: []const u32, timeout_ns: u64) Error!void {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-        const now_ns: i128 = @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+        const now_ns: i128 = std.Io.Clock.awake.now(self.io).nanoseconds;
         const deadline: i128 = now_ns + @as(i128, timeout_ns);
         const abs: i64 = if (deadline > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(deadline);
 
@@ -623,7 +618,7 @@ test "freeBo unbind op encodes BIND_UNBIND over the BO's VA range, no handle" {
 test "open on a box without an asahi node returns NoDevice (not a crash)" {
     // On this aarch64-linux dev box there is no AGX GPU, so discovery must
     // cleanly report NoDevice rather than fault. (On the M1 it opens the node.)
-    const r = Device.open();
+    const r = Device.open(std.testing.io);
     if (r) |dev| {
         var d = dev;
         d.deinit();

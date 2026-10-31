@@ -59,7 +59,7 @@ pub const main = if (is_uefi) uefiMain else linuxMain;
 // Linux path: the kernel asahi DRM probe (the existing, M1-verified milestone 1).
 // ===========================================================================
 
-fn linuxMain(init: std.process.Init.Minimal) void {
+fn linuxMain(init: std.process.Init) void {
     // The single per-target writer (buffered stdout on Linux) for the greppable
     // data lines. flush on return so the buffered lines are not lost. std.log /
     // std.debug.print also work natively on Linux.
@@ -72,7 +72,7 @@ fn linuxMain(init: std.process.Init.Minimal) void {
     // capture - see asahi.dumpStream). It is checked first and works anywhere.
     var forced: ?[]const u8 = null;
     var dump_render = false;
-    var it = init.args.iterate();
+    var it = init.minimal.args.iterate();
     _ = it.next(); // argv[0]
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--dump-render")) {
@@ -91,19 +91,19 @@ fn linuxMain(init: std.process.Init.Minimal) void {
 
     var dev = blk: {
         if (forced) |p| {
-            break :blk asahi.Device.openNode(p) catch {
+            break :blk asahi.Device.openNode(init.io, p) catch {
                 lw.print("RESULT: SKIP could-not-open {s}\n", .{p}) catch {};
                 return;
             };
         }
-        break :blk asahi.Device.open() catch {
+        break :blk asahi.Device.open(init.io) catch {
             // Dump the render nodes that DO exist + their kernel drivers, so a
             // driver-name mismatch (or a missing node) is visible rather than a
             // bare SKIP. Force a node directly with: asahi-info /dev/dri/renderD128
             var n: u32 = 128;
             while (n < 140) : (n += 1) {
                 var nb: [32]u8 = undefined;
-                if (asahi.Device.renderNodeDriver(n, &nb)) |drv| {
+                if (asahi.Device.renderNodeDriver(init.io, n, &nb)) |drv| {
                     lw.print("  renderD{d}: driver={s}\n", .{ n, drv }) catch {};
                 }
             }
